@@ -14,6 +14,9 @@ time. **anylinuxfs-automount** is a small LaunchDaemon that does it for you.
 - For LUKS partitions, a native macOS dialog asks for the passphrase.
 - The passphrase is never stored or logged.
 - A drive you unmount by hand stays unmounted until you replug it.
+- Before the Mac sleeps, the drives are unmounted and their VMs stopped. After
+  wake they are mounted again. This prevents a kernel panic, see
+  [Sleep and wake](#sleep-and-wake).
 
 <p align="center"><i>plug in → (passphrase dialog if encrypted) → drive appears in <code>/Volumes</code> and Finder</i></p>
 
@@ -27,6 +30,8 @@ time. **anylinuxfs-automount** is a small LaunchDaemon that does it for you.
   brew install nohajc/anylinuxfs/anylinuxfs
   anylinuxfs init
   ```
+- [SleepWatcher](https://www.bernhard-baehr.de/), for the sleep and wake hooks:
+  `brew install sleepwatcher`. You don't need to start its Homebrew service.
 - Xcode Command Line Tools, to compile the launcher (`xcode-select --install`).
 - Admin rights.
 
@@ -66,6 +71,7 @@ launcher, so you have to grant Full Disk Access again (see
 | Unmount before unplugging | `anylinuxfs unmount` (all drives) or `anylinuxfs unmount /Volumes/<label>` |
 | Mount again without replugging | `sudo anylinuxfs mount --ignore-permissions /dev/diskXsY` |
 | See what happened | `tail -f /var/log/anylinuxfs-automount.log` and `anylinuxfs log` |
+| Sleep with drives attached | Nothing to do: the drives are unmounted before sleep and mounted again after wake. An encrypted drive asks for its passphrase again. |
 | Uninstall | `sudo ./uninstall.sh` |
 
 > **Always unmount before unplugging.** Ejecting from Finder only removes the NFS share;
@@ -116,6 +122,31 @@ in, the drive waits until someone logs in.
 the script decides whether a mount succeeded by looking for `diskXsY.local:` in
 `mount`, not by the exit code.
 
+### Sleep and wake
+
+A second LaunchDaemon, `hu.goncziakos.anylinuxfs-automount.sleep`, keeps
+[SleepWatcher](https://www.bernhard-baehr.de/) running as root.
+
+- **Before sleep** it runs `anylinuxfs-automount-sleep.sh`. The script unmounts
+  every anylinuxfs drive with `anylinuxfs unmount` and waits for its VM to exit. If
+  that fails, for example because a file is still open, it force-unmounts the share
+  and stops the VM. macOS waits for the script, but only for about 30 seconds. The
+  IOMedia ids of the unmounted drives are saved in
+  `/var/run/anylinuxfs-automount.resume`.
+- **After wake** it runs `anylinuxfs-automount-wake.sh`. The script removes those ids
+  from the "handled" list, so the automount daemon mounts the drives again within
+  ~5 seconds. A drive that was unplugged meanwhile is simply skipped.
+
+**Why this is needed.** An anylinuxfs VM keeps the raw `/dev/diskN` open for as long
+as it runs. If a dock or USB hub drops the drive during sleep, macOS has to remove
+the old disk device on wake. While the VM still holds it, that removal never
+finishes, and after 60 seconds `watchdogd` panics the Mac:
+
+```
+panic(cpu 0 caller …): busy timeout[1], (60s): 'IOMediaBSDClient' …
+Panicked task …: pid …: watchdogd
+```
+
 ## Configuration
 
 The tunables are at the top of `src/anylinuxfs-automount.sh`. After editing, run
@@ -138,10 +169,14 @@ anylinuxfs's own settings (`anylinuxfs config`) still apply.
 | `src/launcher.c` | `/usr/local/libexec/anylinuxfs-automount` (compiled) |
 | `src/anylinuxfs-automount.sh` | `/usr/local/libexec/anylinuxfs-automount.sh` |
 | `launchd/anylinuxfs-automount.plist.in` | `/Library/LaunchDaemons/hu.goncziakos.anylinuxfs-automount.plist` |
+| `src/anylinuxfs-automount-sleep.sh` | `/usr/local/libexec/anylinuxfs-automount-sleep.sh` |
+| `src/anylinuxfs-automount-wake.sh` | `/usr/local/libexec/anylinuxfs-automount-wake.sh` |
+| `launchd/anylinuxfs-automount-sleep.plist.in` | `/Library/LaunchDaemons/hu.goncziakos.anylinuxfs-automount.sleep.plist` |
 | `install.sh`, `uninstall.sh` | – |
 
 At runtime the tool also uses `/var/log/anylinuxfs-automount.log`,
-`/var/run/anylinuxfs-automount.handled` and `/var/run/anylinuxfs-automount.lock`.
+`/var/run/anylinuxfs-automount.handled`, `/var/run/anylinuxfs-automount.resume` and
+`/var/run/anylinuxfs-automount.lock`.
 
 ## Troubleshooting
 
@@ -166,6 +201,12 @@ Check `diskutil list`. The partition type must be the GPT *Linux LUKS* GUID abov
 A LUKS container in a partition typed as *Linux filesystem* is passed to anylinuxfs
 without a passphrase, and anylinuxfs fails. Either change the partition type to
 LUKS (`sgdisk -t N:8309`) or mount it by hand.
+
+**The Mac restarted with `busy timeout … 'IOMediaBSDClient'` in the panic report.**
+A disk device could not be removed because an anylinuxfs VM still held it. See
+[Sleep and wake](#sleep-and-wake). Check that the sleep daemon is running:
+`sudo launchctl print system/hu.goncziakos.anylinuxfs-automount.sleep`. Lines tagged
+`[sleep]` and `[wake]` in the log show what happened around sleep.
 
 **Nothing at all happens.**
 Run `sudo launchctl print system/hu.goncziakos.anylinuxfs-automount`. It shows
@@ -243,6 +284,17 @@ each step explains a design decision that might otherwise look odd.
    - raise `ram_size_mib` to 2560 just for the LUKS mount and restore it right
      after, so plain ext4 mounts keep their small VM;
    - judge success by the mount table instead of the exit code.
+
+10. **Kernel panic after waking up.** The Mac restarted with
+    `busy timeout[1], (60s): 'IOMediaBSDClient'`, raised by `watchdogd`, two minutes
+    after waking from sleep. The panic log showed the USB and Thunderbolt
+    controllers being reloaded at wake, and the automount log showed the drive
+    coming back under a new disk number. The dock had dropped the drive during
+    sleep, but the VM mounted in the morning still had the old `/dev/diskN` open,
+    so the kernel could not remove it. Fix: a SleepWatcher hook unmounts the drives
+    and stops the VMs before sleep. Instead of mounting the drives itself, the wake
+    hook only clears their "handled" entries, so all mounting (and every passphrase
+    dialog) stays in one place, the automount script.
 
 ## License
 

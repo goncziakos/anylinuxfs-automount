@@ -9,9 +9,14 @@ LAUNCHER="$LIBEXEC/anylinuxfs-automount"
 SCRIPT="$LIBEXEC/anylinuxfs-automount.sh"
 PLIST="/Library/LaunchDaemons/$LABEL.plist"
 LOG="/var/log/anylinuxfs-automount.log"
+SLEEP_LABEL="$LABEL.sleep"
+SLEEP_SCRIPT="$LIBEXEC/anylinuxfs-automount-sleep.sh"
+WAKE_SCRIPT="$LIBEXEC/anylinuxfs-automount-wake.sh"
+SLEEP_PLIST="/Library/LaunchDaemons/$SLEEP_LABEL.plist"
 
 # Earlier, unpublished version of this tool (removed if present)
 LEGACY_LABEL="hu.goncziakos.ext4-automount"
+LEGACY_SLEEP_LABEL="hu.goncziakos.ext4-sleepwatcher"
 
 cd "$(dirname "$0")"
 
@@ -35,6 +40,14 @@ fi
     || die "anylinuxfs not found (brew install nohajc/anylinuxfs/anylinuxfs, or set ANYLINUXFS=/path)"
 [ -d "$USER_HOME/.anylinuxfs" ] \
     || die "anylinuxfs is not initialised for $USER_NAME; run 'anylinuxfs init' (or mount a drive once by hand) first"
+SLEEPWATCHER="${SLEEPWATCHER:-}"
+if [ -z "$SLEEPWATCHER" ]; then
+    for p in /opt/homebrew/sbin/sleepwatcher /usr/local/sbin/sleepwatcher; do
+        [ -x "$p" ] && SLEEPWATCHER="$p" && break
+    done
+fi
+[ -n "$SLEEPWATCHER" ] && [ -x "$SLEEPWATCHER" ] \
+    || die "sleepwatcher not found (brew install sleepwatcher, or set SLEEPWATCHER=/path)"
 command -v cc >/dev/null || die "no C compiler; install the Xcode Command Line Tools: xcode-select --install"
 
 echo "==> Building launcher"
@@ -42,17 +55,26 @@ mkdir -p build
 cc -O2 -Wall -Wextra -DSCRIPT_PATH="\"$SCRIPT\"" -o build/anylinuxfs-automount src/launcher.c
 
 echo "==> Removing previous installation (if any)"
-for l in "$LABEL" "$LEGACY_LABEL"; do
+for l in "$LABEL" "$SLEEP_LABEL" "$LEGACY_LABEL" "$LEGACY_SLEEP_LABEL"; do
     launchctl bootout "system/$l" 2>/dev/null || true
 done
 rm -f "/Library/LaunchDaemons/$LEGACY_LABEL.plist" \
-      "$LIBEXEC/ext4-automount" "$LIBEXEC/ext4-automount.sh"
+      "/Library/LaunchDaemons/$LEGACY_SLEEP_LABEL.plist" \
+      "$LIBEXEC/ext4-automount" "$LIBEXEC/ext4-automount.sh" \
+      "$LIBEXEC/ext4-automount-sleep.sh" "$LIBEXEC/ext4-automount-wake.sh"
 
 echo "==> Installing files"
 install -d -o root -g wheel -m 755 "$LIBEXEC"
 install -o root -g wheel -m 755 build/anylinuxfs-automount "$LAUNCHER"
 install -o root -g wheel -m 755 src/anylinuxfs-automount.sh "$SCRIPT"
-sed -e "s|@LABEL@|$LABEL|g" \
+install -o root -g wheel -m 755 src/anylinuxfs-automount-sleep.sh "$SLEEP_SCRIPT"
+install -o root -g wheel -m 755 src/anylinuxfs-automount-wake.sh "$WAKE_SCRIPT"
+render() {
+  sed -e "s|@LABEL@|$LABEL|g" \
+    -e "s|@SLEEP_LABEL@|$SLEEP_LABEL|g" \
+    -e "s|@SLEEPWATCHER@|$SLEEPWATCHER|g" \
+    -e "s|@SLEEP_SCRIPT@|$SLEEP_SCRIPT|g" \
+    -e "s|@WAKE_SCRIPT@|$WAKE_SCRIPT|g" \
     -e "s|@LAUNCHER@|$LAUNCHER|g" \
     -e "s|@ANYLINUXFS@|$ANYLINUXFS|g" \
     -e "s|@ANYLINUXFS_DIR@|$(dirname "$ANYLINUXFS")|g" \
@@ -61,13 +83,17 @@ sed -e "s|@LABEL@|$LABEL|g" \
     -e "s|@UID@|$USER_UID|g" \
     -e "s|@GID@|$USER_GID|g" \
     -e "s|@LOG@|$LOG|g" \
-    launchd/anylinuxfs-automount.plist.in > "$PLIST"
-chown root:wheel "$PLIST"
-chmod 644 "$PLIST"
-plutil -lint "$PLIST" >/dev/null
+    "$1" > "$2"
+  chown root:wheel "$2"
+  chmod 644 "$2"
+  plutil -lint "$2" >/dev/null
+}
+render launchd/anylinuxfs-automount.plist.in "$PLIST"
+render launchd/anylinuxfs-automount-sleep.plist.in "$SLEEP_PLIST"
 
-echo "==> Starting LaunchDaemon $LABEL"
+echo "==> Starting LaunchDaemons $LABEL, $SLEEP_LABEL"
 launchctl bootstrap system "$PLIST"
+launchctl bootstrap system "$SLEEP_PLIST"
 
 cat <<EOF
 
